@@ -8,8 +8,8 @@ import re
 import io
 from six import string_types, integer_types
 
-from neuralcoref.compat import unicode_
-from neuralcoref.utils import encode_distance, parallel_process
+from neuralcoref.train.compat import unicode_
+from neuralcoref.train.utils import encode_distance, parallel_process
 
 try:
     from itertools import izip_longest as zip_longest
@@ -18,6 +18,8 @@ except ImportError: # will be 3.x series
 
 import spacy
 import numpy as np
+
+from tabulate import tabulate
 
 #########################
 ####### UTILITIES #######
@@ -28,8 +30,10 @@ NO_COREF_LIST = ["i", "me", "my", "you", "your"]
 MENTION_TYPE = {"PRONOMINAL": 0, "NOMINAL": 1, "PROPER": 2, "LIST": 3}
 MENTION_LABEL = {0: "PRONOMINAL", 1: "NOMINAL", 2: "PROPER", 3: "LIST"}
 
-PROPERS_TAGS = ["NN", "NNS", "NNP", "NNPS"]
-ACCEPTED_ENTS = ["PERSON", "NORP", "FACILITY", "ORG", "GPE", "LOC", "PRODUCT", "EVENT", "WORK_OF_ART", "LANGUAGE"]
+# PROPERS_TAGS = ["NN", "NNS", "NNP", "NNPS"]
+PROPERS_TAGS = ["NN", "NE", "NNE"]
+# ACCEPTED_ENTS = ["PERSON", "NORP", "FACILITY", "ORG", "GPE", "LOC", "PRODUCT", "EVENT", "WORK_OF_ART", "LANGUAGE"]
+ACCEPTED_ENTS = ["LOC", "ORG", "PER"]
 WHITESPACE_PATTERN = r"\s+|_+"
 UNKNOWN_WORD = "*UNK*"
 MISSING_WORD = "<missing>"
@@ -44,8 +48,13 @@ def extract_mentions_spans(doc, blacklist=True, debug=False):
     Extract potential mentions from a spacy parsed Doc
     '''
     if debug: print('===== doc ====:', doc)
-    for c in doc:
-        if debug: print("🚧 span search:", c, "head:", c.head, "tag:", c.tag_, "pos:", c.pos_, "dep:", c.dep_)
+    if debug:
+        tablines = []
+        print("🚧 span search:")
+        for c in doc:
+            tablines.append(["🚧", c, c.head, c.tag_, c.pos_, c.dep_])
+            # if debug: print("🚧 span search:", c, "head:", c.head, "tag:", c.tag_, "pos:", c.pos_, "dep:", c.dep_)
+        print(tabulate(tablines, headers=["", "Token", "Head", "Tag", "Pos", "Dep"]))
     # Named entities
     mentions_spans = list(ent for ent in doc.ents if ent.label_ in ACCEPTED_ENTS)
 
@@ -64,15 +73,24 @@ def extract_mentions_spans(doc, blacklist=True, debug=False):
 
     return cleaned_mentions_spans
 
-def _extract_from_sent(doc, span, blacklist=True, debug=False):
+def _extract_from_sent(doc, span, blacklist=True, debug=True):
     '''
     Extract Pronouns and Noun phrases mentions from a spacy Span
     '''
-    keep_tags = re.compile(r"N.*|PRP.*|DT|IN")
-    leave_dep = ["det", "compound", "appos"]
-    keep_dep = ["nsubj", "dobj", "iobj", "pobj"]
-    nsubj_or_dep = ["nsubj", "dep"]
-    conj_or_prep = ["conj", "prep"]
+    # keep_tags = re.compile(r"N.*|PRP.*|DT|IN")
+    # pronoun_tags = re.compile(r"PRP.*")
+    keep_tags = re.compile(r"N.*|PPER|PPOS.*|ART|KOU.*|APPR.*")
+    pronoun_tags = re.compile(r"PPER|PPOS.*")
+    # leave_dep = ["det", "compound", "appos"]
+    leave_dep = ["nk", "app"]   # noun kernel element, apposition
+    # keep_dep = ["nsubj", "dobj", "iobj", "pobj"]
+    # subj_dep = re.compile("nsubj")
+    keep_dep = "sb sbp oa oc og op".split()
+    subj_dep = re.compile("sb")
+    # nsubj_or_dep = ["nsubj", "dep"]
+    nsubj_or_dep = "sb sbp".split()
+    # conj_or_prep = ["conj", "prep"]
+    conj_or_prep = "cj op".split()
     remove_pos = ["CCONJ", "INTJ", "ADP"]
     lower_not_end = ["'s", ',', '.', '!', '?', ':', ';']
 
@@ -103,12 +121,12 @@ def _extract_from_sent(doc, span, blacklist=True, debug=False):
             continue
 
         # pronoun
-        if re.match(r"PRP.*", token.tag_):
-            if debug: print("PRP")
+        if pronoun_tags.match(token.tag_):
+            if debug: print("PRONOUN")
             endIdx = token.i + 1
 
             span = doc[token.i: endIdx]
-            if debug: print("==-- PRP store:", span)
+            if debug: print("==-- PRONOUN store:", span)
             mentions_spans.append(span)
 
             # when pronoun is a part of conjunction (e.g., you and I)
@@ -132,7 +150,7 @@ def _extract_from_sent(doc, span, blacklist=True, debug=False):
                 if debug:
                     print("token head:", h, h.dep_, "head:", h.head)
                     print(id(h.head), id(h))
-                if h.dep_ == "nsubj":
+                if subj_dep.match(h.dep_):
                     minchild_idx = min((c.left_edge.i for c in doc if c.head.i == h.head.i and c.dep_ in nsubj_or_dep),
                                        default=token.i)
                     maxchild_idx = max((c.right_edge.i for c in doc if c.head.i == h.head.i and c.dep_ in nsubj_or_dep),
@@ -725,18 +743,26 @@ class Document(object):
                             antecedents.add(match_idx)
             yield i, antecedents
 
-def mention_detection_debug(sentence):
+def mention_detection_debug(sentence, lang="en"):
     print(u"🌋 Loading spacy model")
-    try:
-        spacy.info('en_core_web_sm')
-        model = 'en_core_web_sm'
-    except IOError:
-        print("No spacy 2 model detected, using spacy1 'en' model")
-        spacy.info('en')
-        model = 'en'
+    if lang == "en":
+        try:
+            spacy.info('en_core_web_sm')
+            model = 'en_core_web_sm'
+        except IOError:
+            print("No spacy 2 model detected, using spacy1 'en' model")
+            spacy.info('en')
+            model = 'en'
+    elif lang == "de":
+        try:
+            spacy.info("de_core_news_sm")
+            model = "de_core_news_sm"
+        except IOError as e:
+            print("german model not there")
     nlp = spacy.load(model)
-    doc = nlp(sentence.decode('utf-8'))
+    doc = nlp(sentence)
     mentions = extract_mentions_spans(doc, blacklist=False, debug=True)
+    print("==-=-= Extracted mentions =-=-==")
     for mention in mentions:
         print(mention)
 
@@ -746,4 +772,7 @@ if __name__ == '__main__':
         sent = sys.argv[1]
         mention_detection_debug(sent)
     else:
-        mention_detection_debug(u"My sister has a dog. She loves him.")
+        # mention_detection_debug(u"My sister has a dog. She loves him.")
+        mention_detection_debug(u"Mein Schwester und Ich haben einen Hund. "
+                                u"Sie liebt ihn. "
+                                u"Aber nicht mich.", lang="de")
